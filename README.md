@@ -5,7 +5,7 @@
 
 * Clone the repository
 ```
-% git clone -b powervc-2.2 --single-branch git@github.com:Infinidat/infinidat-powervc-cinder.git 
+% git clone -b powervc-2.2.0 --single-branch git@github.com:Infinidat/infinidat-powervc-cinder.git 
 % cd infinidat-powervc-cinder
 ```
 * Edit the `infinidat.sh` file and modify the configuration options:
