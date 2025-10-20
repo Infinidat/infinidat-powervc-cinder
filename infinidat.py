@@ -18,6 +18,7 @@ import collections
 from contextlib import contextmanager
 import functools
 import math
+import numbers
 import platform
 import socket
 import sys
@@ -27,6 +28,7 @@ from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import units
 
+from cinder.common import constants
 from cinder import context as cinder_context
 from cinder import coordination
 from cinder import context as ctx
@@ -43,8 +45,11 @@ from cinder.volume import volume_types
 from cinder.volume import volume_utils
 from cinder.zonemanager import utils as fczm_utils
 from powervc_cinder.zonemanager.powervc_utils import THREADLOCAL
-from powervc_cinder.volume import discovery_driver
 from powervc_cinder.db import api as powervc_db_api
+from powervc_cinder.volume import discovery_driver
+from powervc_cinder.volume.discovery_driver import PORT_LOCATION
+from powervc_cinder.volume.discovery_driver import PORT_STATUS
+from powervc_cinder.volume.discovery_driver import UNKNOWN_VALUE
 
 
 RESTRICTED_METADATA_VDISK_ID_KEY = "vdisk_id"
@@ -167,10 +172,11 @@ class InfiniboxVolumeDriver(san.SanISCSIDriver, discovery_driver.VolumeDiscovery
         1.15 - fixed backup for attached volume
         1.16 - added support for PowerVC 2.2.0
         1.17 - added support for snapshot promotion
+        1.18 - added support for PowerVC 2.3.1
 
     """
 
-    VERSION = '1.17'
+    VERSION = '1.18'
 
     # ThirdPartySystems wiki page
     CI_WIKI_NAME = "INFINIDAT_CI"
@@ -234,12 +240,12 @@ class InfiniboxVolumeDriver(san.SanISCSIDriver, discovery_driver.VolumeDiscovery
         self._backend_name = backend_name or self.__class__.__name__
         self._volume_stats = None
         if self.configuration.infinidat_storage_protocol.lower() == 'iscsi':
-            self._protocol = 'iSCSI'
+            self._protocol = constants.ISCSI
             if len(self.configuration.infinidat_iscsi_netspaces) == 0:
                 msg = _('No iSCSI network spaces configured')
                 raise exception.VolumeDriverException(message=msg)
         else:
-            self._protocol = 'FC'
+            self._protocol = constants.FC
         if (self.configuration.infinidat_use_compression and
            not self._system.compat.has_compression()):
             # InfiniBox systems support compression only from v3.0 and up
@@ -252,7 +258,8 @@ class InfiniboxVolumeDriver(san.SanISCSIDriver, discovery_driver.VolumeDiscovery
         LOG.debug('setup complete')
 
     def validate_connector(self, connector):
-        required = 'initiator' if self._protocol == 'iSCSI' else 'wwpns'
+        required = ('initiator' if self._protocol == constants.ISCSI
+                    else 'wwpns')
         if required not in connector:
             LOG.error('The volume driver requires %(data)s '
                       'in the connector.', {'data': required})
@@ -457,9 +464,9 @@ class InfiniboxVolumeDriver(san.SanISCSIDriver, discovery_driver.VolumeDiscovery
     def _get_online_fc_ports(self):
         nodes = self._system.components.nodes.get_all()
         for node in nodes:
-            for port in node.get_fc_ports():
-                if (port.get_link_state().lower() == 'up' and
-                   port.get_state() == 'OK'):
+            ports = node.get_fc_ports()
+            for port in ports:
+                if port and port.is_link_up():
                     yield str(port.get_wwpn())
 
     def _initialize_connection_fc(self, volume, connector):
@@ -559,7 +566,7 @@ class InfiniboxVolumeDriver(san.SanISCSIDriver, discovery_driver.VolumeDiscovery
         if connector is None:
             # If no connector was provided it is a force-detach - remove all
             # host connections for the volume
-            if self._protocol == 'FC':
+            if self._protocol == constants.FC:
                 port_cls = wwn.WWN
             else:
                 port_cls = iqn.IQN
@@ -571,7 +578,7 @@ class InfiniboxVolumeDriver(san.SanISCSIDriver, discovery_driver.VolumeDiscovery
                 host_ports = [port for port in host_ports
                               if isinstance(port, port_cls)]
                 ports.extend(host_ports)
-        elif self._protocol == 'FC':
+        elif self._protocol == constants.FC:
             ports = [wwn.WWN(wwpn) for wwpn in connector['wwpns']]
         else:
             ports = [iqn.IQN(connector['initiator'])]
@@ -588,7 +595,7 @@ class InfiniboxVolumeDriver(san.SanISCSIDriver, discovery_driver.VolumeDiscovery
                 volume.volume_attachment):
             return False
         keys = ['system uuid']
-        if self._protocol == 'FC':
+        if self._protocol == constants.FC:
             keys.append('wwpns')
         else:
             keys.append('initiator')
@@ -617,7 +624,7 @@ class InfiniboxVolumeDriver(san.SanISCSIDriver, discovery_driver.VolumeDiscovery
 
     @coordination.synchronized('infinidat-{self.management_address}-lock')
     def _initialize_connection(self, volume, connector):
-        if self._protocol == 'FC':
+        if self._protocol == constants.FC:
             initialize_connection = self._initialize_connection_fc
         else:
             initialize_connection = self._initialize_connection_iscsi
@@ -636,7 +643,7 @@ class InfiniboxVolumeDriver(san.SanISCSIDriver, discovery_driver.VolumeDiscovery
     @coordination.synchronized('infinidat-{self.management_address}-lock')
     def _terminate_connection(self, volume, connector):
         infinidat_volume = self._get_infinidat_dataset(volume)
-        if self._protocol == 'FC':
+        if self._protocol == constants.FC:
             volume_type = 'fibre_channel'
         else:
             volume_type = 'iscsi'
@@ -656,7 +663,7 @@ class InfiniboxVolumeDriver(san.SanISCSIDriver, discovery_driver.VolumeDiscovery
             # check if the host now doesn't have mappings
             if host is not None and len(host.get_luns()) == 0:
                 host.safe_delete()
-                if self._protocol == 'FC' and connector is not None:
+                if self._protocol == constants.FC and connector is not None:
                     # Create initiator-target mapping to delete host entry
                     # this is only relevant for regular (specific host) detach
                     target_wwpns = list(self._get_online_fc_ports())
@@ -673,7 +680,7 @@ class InfiniboxVolumeDriver(san.SanISCSIDriver, discovery_driver.VolumeDiscovery
                 'volume': volume,
                 'connector': connector,
             }
-        if self._protocol == 'FC':
+        if self._protocol == constants.FC:
             try:
                 fczm_utils.remove_fc_zone(conn_info)
             except:
@@ -1831,3 +1838,34 @@ class InfiniboxVolumeDriver(san.SanISCSIDriver, discovery_driver.VolumeDiscovery
         LOG.debug('Update restricted metadata: %s', metadata)
         powervc_db_api.volume_restricted_metadata_update_or_create(
             ctx.get_admin_context(), volume_obj['id'], metadata)
+
+    def discover_storage_ports(self, details=False, fabric_map=False,
+                               all_ports=False):
+        available_ports = dict()
+        nodes = self._system.components.nodes.get_all()
+        for node in nodes:
+            node_name = node.get_name()
+            ports = node.get_fc_ports()
+            for port in ports:
+                port_state = port.get_state()
+                port_index = port.get_index()
+                port_name = '%s (%s)' % (port_index, node_name)
+                port_location = '%s-%s' % (node_name, port_index)
+                wwpn = str(port.get_wwpn())
+                port_wwpn = ':'.join(wwpn[i:i+2] for i in range(0, 16, 2))
+                fields = port.get_fields()
+                port_speed = fields.get('connection_speed')
+                if isinstance(port_speed, numbers.Number):
+                    port_speed = str(int(port_speed / 1000 ** 3))
+                else:
+                    port_speed = UNKNOWN_VALUE
+                available_ports[port_wwpn] = {
+                    'wwpn': port_wwpn,
+                    'port_name': port_name,
+                    'speed': port_speed,
+                    PORT_LOCATION: port_location,
+                    PORT_STATUS: port_state
+                }
+        if fabric_map:
+            self._add_fabric_mapping(available_ports)
+        return available_ports
